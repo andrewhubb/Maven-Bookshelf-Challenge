@@ -2,7 +2,6 @@ transformers
 torch
 pandas
 sqlalchemy
-pymysql
 vaderSentiment
+vaderSentiment.vaderSentiment
 tqdm
-pyarrow
