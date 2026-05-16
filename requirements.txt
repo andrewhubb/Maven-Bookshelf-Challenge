@@ -6,3 +6,4 @@ pymysql
 vaderSentiment
 tqdm
 pyarrow
+Plotly
