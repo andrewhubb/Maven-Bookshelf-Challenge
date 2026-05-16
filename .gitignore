@@ -6,4 +6,5 @@
 **/emotion_chucks-old/*.*
 **/sentiment_chunks/*.*
 **/sentiment_chucks_old/*.*
+.claude/
 venv/
