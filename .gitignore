@@ -8,3 +8,4 @@
 **/sentiment_chucks_old/*.*
 .claude/
 venv/
+.DS_Store
