@@ -2,22 +2,21 @@
 Maven Bookshelf — Sentiment & Emotion Analysis Pipeline
 CUDA edition  (NVIDIA GPU / Windows or Linux)
 
-Equivalent to clean_and_write_data_to_mysql_apple_silicon-optimised-claude-logged.py
-but targets CUDA instead of MPS.
+Equivalent to pipeline_apple_silicon.py but targets CUDA instead of MPS.
 
 Windows sleep prevention is handled automatically via the Windows API so you
 don't need an external tool like caffeinate. On Linux, run the script with
 systemd-inhibit to prevent sleep:
-    systemd-inhibit python clean_and_write_data_to_mysql_cuda-logged.py
+    systemd-inhibit python pipeline_cuda.py
 
-MySQL server address: update SQLSERVER below before running.
-Data paths:          update ONEDRIVE_PATH below if your OneDrive location differs.
-Batch sizes:         tune WORKS_BATCH_SIZE / REVIEWS_BATCH_SIZE for your GPU VRAM.
-                     32 is a safe conservative starting point for most RTX cards.
-                     Increase if VRAM allows; decrease if you see CUDA OOM errors.
+config.ini:  copy config.ini.template to config.ini and fill in credentials.
+Data paths:  update ONEDRIVE_PATH below if your OneDrive location differs.
+Batch sizes: tune WORKS_BATCH_SIZE / REVIEWS_BATCH_SIZE for your GPU VRAM.
+             32 is a safe conservative starting point for most RTX cards.
+             Increase if VRAM allows; decrease if you see CUDA OOM errors.
 """
 
-import sys, platform, csv, json, gc, contextlib
+import sys, platform, csv, json, gc, contextlib, configparser
 import torch
 import pandas as pd
 from transformers import pipeline, logging, AutoTokenizer, AutoModelForSequenceClassification
@@ -42,15 +41,23 @@ else:
 
 DATA_PATH = f'{ONEDRIVE_PATH}/Data/Maven Bookshelf'
 
-# ── MySQL server ──────────────────────────────────────────────────────────────
-# Update this to the IP of your Linux Hyper-V VM before running
-#SQLSERVER = '192.168.1.197'   # placeholder — confirm before running
-SQLSERVER = '127.0.0.1'
-# ── Database name ─────────────────────────────────────────────────────────────
-# Change this to match the target database for each machine before running.
-# Create the empty database first if it doesn't already exist:
-#   CREATE DATABASE mavenbookshelf_asus;
-DB_NAME = 'mavenbookshelf_asus'
+# ── Config ────────────────────────────────────────────────────────────────────
+# Credentials and database name are read from config.ini (not committed to Git).
+# Copy config.ini.template to config.ini and fill in your details before running.
+_config = configparser.ConfigParser()
+_config.read(Path(__file__).parent / 'config.ini')
+
+def make_engine():
+    """Create a fresh SQLAlchemy engine from config.ini.
+    Called immediately before each DB write to avoid stale connections
+    after long NLP processing stages.
+    pool_pre_ping tests the connection before use and reconnects if stale.
+    """
+    db = _config['database']
+    return create_engine(
+        f"mysql+pymysql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['dbname']}",
+        pool_pre_ping=True,
+    )
 
 # ── Batch sizes ───────────────────────────────────────────────────────────────
 # Conservative defaults for RTX-class GPUs. Increase if VRAM permits.
@@ -196,7 +203,7 @@ class PipelineLogger:
 
 
 # ── Streaming DB writer ───────────────────────────────────────────────────────
-def write_to_db_streaming(df_name, engine, table_name, chunk_size,
+def write_to_db_streaming(df_name, table_name, chunk_size,
                           sentiment_dir='sentiment_chunks',
                           emotion_dir='emotion_chunks',
                           logger=None):
@@ -206,11 +213,17 @@ def write_to_db_streaming(df_name, engine, table_name, chunk_size,
     VADER sentiment. We merge HF sentiment from the matching sentiment chunk
     then write to the database.
 
+    A fresh engine is created immediately before writing to avoid stale
+    connections after long NLP processing stages (pool_pre_ping=True).
+
     Peak memory per iteration: ~one emotion chunk + one sentiment chunk.
 
     Join key: reviews → review_id (unique per row, avoids many-to-many blowup)
               works   → work_id
     """
+    # Fresh connection immediately before writing — fixes timeout after long NLP runs
+    engine = make_engine()
+
     sentiment_path = Path(sentiment_dir)
     emotion_path   = Path(emotion_dir)
     join_key = 'review_id' if df_name == 'reviews' else 'work_id'
@@ -459,8 +472,6 @@ class ReviewAnalyzer:
 
 prevent_sleep()
 
-engine = create_engine(f'mysql+pymysql://andrew:$H0nggh0rzaq!@{SQLSERVER}:3306/{DB_NAME}')
-
 # Persist start time across restarts so total runtime is always accurate.
 # Delete pipeline_start.txt manually if you want a completely fresh clock.
 _start_file = Path('pipeline_start.txt')
@@ -535,10 +546,9 @@ del analyzer, works
 gc.collect()
 print('Works: analysis complete, works df and models freed - Time:', datetime.now())
 
-# Step 4: Stream chunk files → DB
+# Step 4: Stream chunk files → DB (fresh connection created inside)
 write_to_db_streaming(
     df_name='works',
-    engine=engine,
     table_name='works',
     chunk_size=1000,
     sentiment_dir='./sentiment_chunks',
@@ -597,10 +607,9 @@ del analyzer, reviews
 gc.collect()
 print('Reviews: analysis complete, reviews df and models freed - Time:', datetime.now())
 
-# Step 4: Stream chunk files → DB
+# Step 4: Stream chunk files → DB (fresh connection created inside)
 write_to_db_streaming(
     df_name='reviews',
-    engine=engine,
     table_name='reviews',
     chunk_size=10000,
     sentiment_dir='./sentiment_chunks',

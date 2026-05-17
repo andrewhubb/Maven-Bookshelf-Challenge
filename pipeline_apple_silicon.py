@@ -1,6 +1,6 @@
 from transformers import pipeline, logging, AutoTokenizer, AutoModelForSequenceClassification
 import pandas as pd
-import torch, json, gc, contextlib, csv
+import torch, json, gc, contextlib, csv, configparser
 from torch.quantization import quantize_dynamic
 from datetime import datetime
 from sqlalchemy import create_engine
@@ -8,6 +8,25 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from tqdm import tqdm
 from sqlalchemy.types import JSON
 from pathlib import Path
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+# Credentials and database name are read from config.ini (not committed to Git).
+# Copy config.ini.template to config.ini and fill in your details before running.
+_config = configparser.ConfigParser()
+_config.read(Path(__file__).parent / 'config.ini')
+
+def make_engine():
+    """Create a fresh SQLAlchemy engine from config.ini.
+    Called immediately before each DB write to avoid stale connections
+    after long NLP processing stages.
+    pool_pre_ping tests the connection before use and reconnects if stale.
+    """
+    db = _config['database']
+    return create_engine(
+        f"mysql+pymysql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['dbname']}",
+        pool_pre_ping=True,
+    )
 
 
 # ── Device detection ──────────────────────────────────────────────────────────
@@ -127,7 +146,7 @@ class PipelineLogger:
 
 
 # ── Streaming DB writer ───────────────────────────────────────────────────────
-def write_to_db_streaming(df_name, engine, table_name, chunk_size,
+def write_to_db_streaming(df_name, table_name, chunk_size,
                           sentiment_dir='sentiment_chunks',
                           emotion_dir='emotion_chunks',
                           logger=None):
@@ -137,11 +156,17 @@ def write_to_db_streaming(df_name, engine, table_name, chunk_size,
     VADER sentiment. We merge HF sentiment from the matching sentiment chunk
     then write to the database.
 
+    A fresh engine is created immediately before writing to avoid stale
+    connections after long NLP processing stages (pool_pre_ping=True).
+
     Peak memory per iteration: ~one emotion chunk + one sentiment chunk.
 
     Join key: reviews → review_id (unique per row, avoids many-to-many blowup)
               works   → work_id
     """
+    # Fresh connection immediately before writing — fixes timeout after long NLP runs
+    engine = make_engine()
+
     sentiment_path = Path(sentiment_dir)
     emotion_path   = Path(emotion_dir)
     join_key = 'review_id' if df_name == 'reviews' else 'work_id'
@@ -231,7 +256,8 @@ class ReviewAnalyzer:
         else:
             self.device = device or DEVICE
 
-        print(f'ReviewAnalyzer [{analysis_type}] using device: {self.device}')
+        print(f'ReviewAnalyzer [{analysis_type}] | dataset: {df_name} | '
+              f'device: {self.device} | batch_size: {batch_size}')
 
         base_model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
 
@@ -244,7 +270,7 @@ class ReviewAnalyzer:
             )
             self.hf_pipeline = None
         else:
-            pipeline_device  = self.device if self.device != 'cuda' else 0
+            pipeline_device  = 0 if self.device == 'cuda' else -1
             self.hf_pipeline = pipeline(
                 'text-classification',
                 model=self.model_name,
@@ -261,9 +287,7 @@ class ReviewAnalyzer:
         self.tokenizer   = None
         self.data_frame  = None
         gc.collect()
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
         print(f'✅ [{self.analysis_type}] model released from memory')
 
@@ -329,14 +353,12 @@ class ReviewAnalyzer:
             inputs = self.tokenizer(
                 batch, padding=True, truncation=True, max_length=512, return_tensors='pt'
             )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            if device == 'cuda':
-                ctx = torch.autocast('cuda')
-            elif device == 'cpu':
-                ctx = torch.autocast('cpu')
+            if device in ('cuda', 'mps'):
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                ctx = torch.autocast(device) if device == 'cuda' else contextlib.nullcontext()
             else:
-                ctx = contextlib.nullcontext()   # MPS: autocast not supported
+                ctx = contextlib.nullcontext()
 
             with ctx, torch.no_grad():
                 outputs = self.model(**inputs)
@@ -391,14 +413,6 @@ class ReviewAnalyzer:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Pipeline — setup
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# ── Database name ─────────────────────────────────────────────────────────────
-# Change this to match the target database for each machine before running.
-# Create the empty database first if it doesn't already exist:
-#   CREATE DATABASE mavenbookshelf_macbook;
-DB_NAME = 'mavenbookshelf_macbook'
-
-engine = create_engine(f'mysql+pymysql://andrew:$H0nggh0rzaq!@localhost:3306/{DB_NAME}')
 
 # Persist start time across restarts so total runtime is always accurate.
 # Delete pipeline_start.txt manually if you want a completely fresh clock.
@@ -477,10 +491,9 @@ del analyzer, works
 gc.collect()
 print('Works: analysis complete, works df and models freed - Time:', datetime.now())
 
-# Step 4: Stream chunk files → DB
+# Step 4: Stream chunk files → DB (fresh connection created inside)
 write_to_db_streaming(
     df_name='works',
-    engine=engine,
     table_name='works',
     chunk_size=1000,
     sentiment_dir='./sentiment_chunks',
@@ -539,10 +552,9 @@ del analyzer, reviews
 gc.collect()
 print('Reviews: analysis complete, reviews df and models freed - Time:', datetime.now())
 
-# Step 4: Stream chunk files → DB
+# Step 4: Stream chunk files → DB (fresh connection created inside)
 write_to_db_streaming(
     df_name='reviews',
-    engine=engine,
     table_name='reviews',
     chunk_size=10000,
     sentiment_dir='./sentiment_chunks',
